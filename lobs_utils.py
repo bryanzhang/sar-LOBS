@@ -47,13 +47,14 @@ def updateHessianStats(model, inputs):
             inputs = outputs
 
 # 计算各个subblock的hessian和伪逆阵
-def calcHessiansAndPinvs(model):
+def calcHessiansAndPinvs(model, gama):
     print("Sample count:", model.sampleCount)
     for i, (name, layer) in enumerate(model.named_children()):
         if model.hessians[i] is None:
             continue
         h = model.hessians[i]
         h /= model.sampleCount
+        h += gama * torch.eye(h.size(0))
         h *= 2
         print("Layer:", i, "Hessian sub block Shape: ", h.size())
         print("Layer:", i, "Hessian sub block Rank: ", torch.linalg.matrix_rank(h))
@@ -107,7 +108,7 @@ def optimal_brain_surgeon(layer, indices, h_block, hpinv_block):
     flat_weight += delta_w
     return flat_weight.squeeze(1).view(layer.out_features, layer.in_features), loss[0][0].item(), original_delta
 
-def optimal_brain_surgeon_v2(layer, indices, h_block, gama):
+def optimal_brain_surgeon_v2(layer, indices, h_block):
     flat_weight = layer.weight.flatten()
     accum_factor_vector = torch.zeros(layer.in_features * layer.out_features, dtype=torch.float)
     mask = torch.zeros(layer.in_features * layer.out_features, dtype=torch.bool)
@@ -115,7 +116,7 @@ def optimal_brain_surgeon_v2(layer, indices, h_block, gama):
     accum_factor_vector.scatter_(0, indices, flat_weight[mask])
     accum_factor_vector = accum_factor_vector.unsqueeze(1)
     original_beta = custom_kernels.hessianorpinv_matmul_vector(h_block, accum_factor_vector, layer.out_features)
-    original_epsilon = original_beta - 2 * gama * flat_weight.unsqueeze(1)
+    original_epsilon = original_beta
     row_mask = torch.ones(layer.in_features * layer.out_features, dtype=torch.bool)
     row_mask[indices] = False
     epsilon = original_beta[row_mask]
@@ -130,7 +131,7 @@ def optimal_brain_surgeon_v2(layer, indices, h_block, gama):
         mask = hessian_mask[output_no]
         subblock = subblock[mask]
         subblock = subblock[:, mask]
-        subblock = subblock + 2 * gama * torch.eye(subblock.size(0))
+        #subblock = subblock + 2 * gama * torch.eye(subblock.size(0))
         subblock = subblock.contiguous()
         if CHECK_RANK:
             if torch.linalg.matrix_rank(subblock).item() == subblock.size(0):

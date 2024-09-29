@@ -65,8 +65,8 @@ def train_epoch(model, train_loader):
         if (i+1) % 50 == 0:
             print(f'Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
 # 检查CUDA是否可用
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#device = "cpu"
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = "cpu"
 print("Using device:", device)
 
 # 加载保存的模型状态
@@ -80,7 +80,7 @@ transform = transforms.Compose([
 ])
 
 # 加载MNIST测试数据集
-test_dataset = datasets.MNIST(root='./data', train=False, transform=transform)
+test_dataset = datasets.MNIST(root='./data', train=False, transform=transform, download=True)
 test_loader = DataLoader(dataset=test_dataset, batch_size=64, shuffle=False)
 eval(model, test_dataset, test_loader)
 
@@ -100,7 +100,8 @@ for i, (images, labels) in enumerate(train_loader):
 
 model.eval()
 h_pinvs = []
-lobs_utils.calcHessiansAndPinvs(model)
+gama = 10000
+lobs_utils.calcHessiansAndPinvs(model, gama)
 end_time = time.time()
 print("Generating hessian matrix and its pseudo-inverse done, ", end_time - start_time, " seconds elapsed.")
 
@@ -144,8 +145,7 @@ for i, (name, layer) in enumerate(layers):
             start_time = time.time()
             assert(indices.size(0) == count)
             hpinv = model.hpinvs[i]
-            gama = 100000
-            weight, loss, original_delta = lobs_utils.optimal_brain_surgeon_v2(layer, indices, h, gama)
+            weight, loss, original_delta = lobs_utils.optimal_brain_surgeon_v2(layer, indices, h)
             #print("Sample weight after prune 3:", original_weight[(375129 // layer.in_features)][(375129 % layer.in_features)])
             end_time = time.time()
             layer.weight.data = weight
