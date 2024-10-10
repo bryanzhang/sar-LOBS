@@ -45,17 +45,62 @@ class TestLOBS(unittest.TestCase):
         self.assertEqual(torch.linalg.matrix_rank(hessian_block), 3)
         self.assertTrue(torch.allclose(hessian_block, torch.tensor([[  7.3333,  -8.6667,  14.6667],[ -8.6667,  19.3333, -19.3333],[ 14.6667, -19.3333,  41.3333]], dtype=torch.float64)))
         gbase_block = model.gradients[0]
-        #self.assertTrue(torch.equal(gbase_block, torch.tensor([[0], [2], [5]], dtype=torch.float64)))
         hinv_block = model.hpinvs[0]
-        #self.assertTrue(torch.allclose(hinv_block.double(), torch.tensor([[ 0.0458, -0.0036, -0.0007],[-0.0036,  0.0439, -0.0079],[-0.0007, -0.0079,  0.0318]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertTrue(torch.allclose(torch.mm(hessian_block, hinv_block), torch.eye(3).double(), rtol=1e-5, atol=1e-4))
+
         layer = layers[0][1]
         prune_seq_2d, loss_table_2d, accum_delta_w_table_2d = lobs_utils.prePrune(model, layer, hessian_block, hinv_block, gbase_block)
-        print("delta:", accum_delta_w_table_2d[0][0])
+
+        # 第一行的损失及delta weight是否符合预期
         self.assertEqual(prune_seq_2d[0][0], 0)
         self.assertAlmostEqual(loss_table_2d[0][0].item(), 0.00906, places=5)
         self.assertTrue(torch.allclose(accum_delta_w_table_2d[0][0].double(), torch.tensor([[-0.1],[-0.0176], [0.0273]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
 
-        
+        self.assertEqual(prune_seq_2d[0][1], 2)
+        self.assertTrue(torch.allclose(accum_delta_w_table_2d[0][1].double(), torch.tensor([[-0.1],[0.0552], [0.1]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertAlmostEqual(loss_table_2d[0][1].item(), 0.05818139, places=5)
+
+        self.assertEqual(prune_seq_2d[0][2], 1)
+        self.assertTrue(torch.allclose(accum_delta_w_table_2d[0][2].double(), torch.tensor([[-0.1],[-0.2],[0.1]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertAlmostEqual(loss_table_2d[0][2].item(), 0.6294252679246521, places=5)
+
+        # 第二行的损失及delta weight是否符合预期
+        self.assertEqual(prune_seq_2d[1][0], 1)
+        self.assertAlmostEqual(loss_table_2d[1][0].item(), 0.043787834, places=5)
+        self.assertTrue(torch.allclose(accum_delta_w_table_2d[1][0].double(), torch.tensor([[-0.0848],[-0.1], [-0.0167]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+
+        self.assertEqual(prune_seq_2d[1][1], 0)
+        self.assertAlmostEqual(loss_table_2d[1][1].item(), 0.049276660431, places=5)
+        self.assertTrue(torch.allclose(accum_delta_w_table_2d[1][1].double(), torch.tensor([[-0.3],[-0.1], [0.0597]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+
+        self.assertEqual(prune_seq_2d[1][2], 2)
+        self.assertAlmostEqual(loss_table_2d[1][2].item(), 1.3936021722356666, places=5)
+        self.assertTrue(torch.allclose(accum_delta_w_table_2d[1][2].double(), torch.tensor([[-0.3],[-0.1], [-0.2]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+
+        original_weight, loss = lobs_utils.greedyPrune(model, layer, 1, prune_seq_2d, loss_table_2d, accum_delta_w_table_2d)
+        self.assertTrue(torch.allclose(original_weight, torch.tensor([[0.1, 0.2, -0.1], [0.3, 0.1, 0.2]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertTrue(torch.allclose(layer.weight.data, torch.tensor([[0, 0.1824, -0.0727], [0.3, 0.1, 0.2]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertAlmostEqual(loss.item(), 0.00906, places=5)
+        layer.weight.data = original_weight
+
+        original_weight, loss = lobs_utils.greedyPrune(model, layer, 3, prune_seq_2d, loss_table_2d, accum_delta_w_table_2d)
+        self.assertTrue(torch.allclose(original_weight, torch.tensor([[0.1, 0.2, -0.1], [0.3, 0.1, 0.2]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertTrue(torch.allclose(layer.weight.data, torch.tensor([[0, 0.1824, -0.0727], [0, 0, 0.2597]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertAlmostEqual(loss.item(), 0.102124494431, places=5)
+        layer.weight.data = original_weight
+
+        original_weight, loss = lobs_utils.greedyPrune(model, layer, 5, prune_seq_2d, loss_table_2d, accum_delta_w_table_2d)
+        self.assertTrue(torch.allclose(original_weight, torch.tensor([[0.1, 0.2, -0.1], [0.3, 0.1, 0.2]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertTrue(torch.allclose(layer.weight.data, torch.tensor([[0, 0, 0], [0, 0, 0.2597]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertAlmostEqual(loss.item(), 0.7897311523556522, places=5)
+        layer.weight.data = original_weight
+
+        original_weight, loss = lobs_utils.greedyPrune(model, layer, 6, prune_seq_2d, loss_table_2d, accum_delta_w_table_2d)
+        self.assertTrue(torch.allclose(original_weight, torch.tensor([[0.1, 0.2, -0.1], [0.3, 0.1, 0.2]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertTrue(torch.allclose(layer.weight.data, torch.tensor([[0, 0, 0], [0, 0, 0]], dtype=torch.float64), rtol=1e-5, atol=1e-4))
+        self.assertAlmostEqual(loss.item(), 2.183333324591319, places=5)
+        layer.weight.data = original_weight
+
     def testLOBS(self):
         return
         model = SimpleDnn()

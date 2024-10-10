@@ -31,10 +31,8 @@ def updateHessianStats(model, inputs):
     with torch.no_grad():
         model.sampleCount += inputs.size(0)
         for j, (name, layer) in enumerate(model.named_children()):
-            #print(f"Layer Name: {name}, Layer: {layer}")
             outputs = layer(inputs)
             if name in model.withReLUs:
-                #print(f"Layer name: {name}, with relu!")
                 outputs = torch.relu(outputs)
             # 只对FNN的weight剪枝，只计算这部分的hessian
             if not isinstance(layer, nn.Linear):
@@ -99,7 +97,6 @@ def prePrune(model, layer, h, hinv, gbase):
         weight = layer.weight.data[j].clone().view(cols, 1)
         accum_delta_w = torch.zeros(cols, 1, dtype=torch.float64)
         accum_delta_w_itr = torch.zeros(cols, 1, dtype=torch.float64)
-        accum_loss = 0
         mask = torch.zeros(cols, 1, dtype=torch.bool)
         inverted_mask = torch.ones(cols, 1, dtype=torch.bool)
         retain_indices = torch.nonzero(inverted_mask)
@@ -107,6 +104,7 @@ def prePrune(model, layer, h, hinv, gbase):
         loss_table = []
         accum_delta_w_table = [] # 可以减少recomputation，但空间大小为rows*rows*cols float，占800M+
         h = original_h
+        h_fullcol = original_h
         hinv = original_hinv
         gbase = original_gbase
         for c in range(0, cols):
@@ -117,31 +115,19 @@ def prePrune(model, layer, h, hinv, gbase):
             min_delta_w_itr = None
             min_itr_inv = None
             for k in range(0, h.size(0)):
-                print("K:", k)
                 global_pos = retain_indices[k][0]
-                print("GLOBAL_POS:", global_pos)
-                print("HINV:", hinv)
                 inv_row = hinv[:,k].view(1, hinv.size(0))
                 decr = torch.mm(torch.transpose(inv_row, 0, 1), inv_row) / hinv[k][k]
                 tmp_itr_inv = hinv - decr
-                print("TMP_ITR_INV_1:", tmp_itr_inv)
                 tmp_itr_inv = torch.cat((tmp_itr_inv[:k,:], tmp_itr_inv[(k+1):,:]), dim=0)
                 tmp_itr_inv = torch.cat((tmp_itr_inv[:,:k], tmp_itr_inv[:,(k+1):]), dim=1)
-                print("TMP_ITR_INV_2:", tmp_itr_inv)
-                #g = accum_delta_w * gbase + 2 * alpha * accum_delta_w
-                #g = gbase + alpha * accum_delta_w_itr * gbase
-                #g = gbase + 2 * alpha * accum_delta_w
-                g = torch.mm(h, accum_delta_w_itr)
-                print("G:", g)
+                g = torch.mm(h_fullcol, accum_delta_w)
                 beta = weight[global_pos][0] * h[:,k].view(h.size(0), 1)
-                print("BETA_1:", beta)
                 beta -= g
-                print("BETA_2:", beta)
                 beta = torch.cat((beta[:k,], beta[(k+1):,]), dim=0)
-                print("BETA_3:", beta)
                 tmp_delta_w = torch.mm(tmp_itr_inv, beta)
                 tmp_delta_w = torch.cat((tmp_delta_w[:k,], (-weight[global_pos]).view(1,1), tmp_delta_w[k:,]), dim=0)
-                loss = torch.mm(g.t(), tmp_delta_w) + torch.mm(tmp_delta_w.t(), torch.mm(h, tmp_delta_w)) / 2.0
+                loss = torch.mm(g.transpose(0, 1), tmp_delta_w) + torch.mm(tmp_delta_w.transpose(0, 1), torch.mm(h, tmp_delta_w)) / 2.0
                 loss = loss[0].double()
                 if loss < min_loss:
                     min_loss = loss
@@ -149,8 +135,10 @@ def prePrune(model, layer, h, hinv, gbase):
                     min_global_pos = global_pos
                     min_delta_w = tmp_delta_w
                     min_itr_inv = tmp_itr_inv
-                if j == 0 and c == 0 and k == 0:
+                if j == 0 and c == 1 and global_pos == 2:
+                    print("Prev_LOSS:", loss_table[0])
                     print("MIN_LOSS:", min_loss)
+                    print("Prev_DELTA_W:", accum_delta_w_table[0])
                     print("MIN_DELTA_W:", min_delta_w)
                     input("按任意键继续。。。")
             flatten_delta_w = torch.zeros((cols, 1), dtype=torch.float64)
@@ -159,16 +147,16 @@ def prePrune(model, layer, h, hinv, gbase):
             accum_delta_w += flatten_delta_w
             accum_delta_w_itr += min_delta_w
             accum_delta_w_itr = torch.cat((accum_delta_w_itr[:min_pos,], accum_delta_w_itr[(min_pos+1):,:]), dim=0)
-            accum_loss += min_loss
             hinv = min_itr_inv
             h = torch.cat((h[:min_pos,:], h[(min_pos+1):,:]), dim=0)
             h = torch.cat((h[:,:min_pos], h[:,(min_pos+1):]), dim=1)
+            h_fullcol = torch.cat((h_fullcol[:min_pos,:], h_fullcol[(min_pos+1):,:]), dim=0)
             gbase = torch.cat((g[:min_pos,:], g[(min_pos+1):,:]), dim=0)
             mask[min_global_pos][0] = True
             inverted_mask[min_global_pos][0] = False
             retain_indices = torch.nonzero(inverted_mask)
             prune_seq.append(min_global_pos)
-            loss_table.append(accum_loss.clone())
+            loss_table.append(min_loss)
             accum_delta_w_table.append(accum_delta_w.clone())
         prune_seq_2d.append(prune_seq)
         loss_table_2d.append(loss_table)
@@ -195,5 +183,5 @@ def greedyPrune(model, layer, prune_num, prune_seq_2d, loss_table_2d, accum_delt
         j = prune_num_rows[i] - 1
         if j < 0:
             continue
-        layer.weight.data[i] += accum_delta_w_table_2d[i][j].view(col)
+        layer.weight.data[i] += accum_delta_w_table_2d[i][j].view(cols)
     return original_weight, accum_loss
