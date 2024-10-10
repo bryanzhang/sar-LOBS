@@ -100,64 +100,28 @@ for i, (images, labels) in enumerate(train_loader):
 
 model.eval()
 h_pinvs = []
-gama = 10000
-lobs_utils.calcHessiansAndPinvs(model, gama)
+alpha = 10000.0
+lobs_utils.calcHessiansAndPinvs(model, alpha)
 end_time = time.time()
 print("Generating hessian matrix and its pseudo-inverse done, ", end_time - start_time, " seconds elapsed.")
 
-# 逐层剪枝
-STEP=390000
-TOPK=390000
+# 只剪第一层
 layers = list(model.named_children())
 for i, (name, layer) in enumerate(layers):
     if not isinstance(layer, nn.Linear):
         continue
     h = model.hessians[i]
+    hinv = model.hpinvs[i]
+    g_base = model.gradients[i]
     print("Layer: ", i, "name:", name, "Now begin to prune.")
-    with torch.no_grad():
-        for j in range(0, TOPK, STEP):
-            count = j + STEP
-            original_weight = layer.weight.data.clone()
-            #print("Sample weight before prune:", original_weight[(375129 // layer.in_features)][(375129 % layer.in_features)])
-            indices = lobs_utils.prune_fcn_layer(layer, count)
-            assert(indices.size(0) == count)
-
-            w = original_weight.reshape(layer.in_features * layer.out_features).clone()
-            #print("Sample weight before prune 1:", original_weight[(375129 // layer.in_features)][(375129 % layer.in_features)])
-            prune_mask = torch.zeros(layer.in_features * layer.out_features, dtype=torch.bool)
-            prune_mask.index_fill_(0, indices, True)
-            w.masked_fill_(prune_mask, 0.0)
-            layer.weight.data = w.reshape(layer.out_features, layer.in_features)
-            acc = eval(model, test_dataset, test_loader)
-            print("After simply pruning by weight magnitude, acc=", acc)
-            #print("Sample weight after prune:", original_weight[(375129 // layer.in_features)][(375129 % layer.in_features)])
-
-            start_time = time.time()
-            train_epoch(model, train_loader)
-            end_time = time.time()
-            torch.set_grad_enabled(False)
-            #print("Sample weight after prune 1:", original_weight[(375129 // layer.in_features)][(375129 % layer.in_features)])
-            acc = eval(model, test_dataset, test_loader)
-            print("Retrain after pruning", count, "weights, accurate=", acc, ",execution time:", (end_time - start_time), "seconds.")
-            #print("Sample weight after prune 2:", original_weight[(375129 // layer.in_features)][(375129 % layer.in_features)])
-            layer.weight.data = original_weight.clone()
-
-            start_time = time.time()
-            assert(indices.size(0) == count)
-            hpinv = model.hpinvs[i]
-            weight, loss, original_delta = lobs_utils.optimal_brain_surgeon_v2(layer, indices, h)
-            #print("Sample weight after prune 3:", original_weight[(375129 // layer.in_features)][(375129 % layer.in_features)])
-            end_time = time.time()
-            layer.weight.data = weight
-            acc = eval(model, test_dataset, test_loader)
-            flat_weight = original_weight.flatten()
-            original_obs_weights = flat_weight + original_delta.squeeze(1)
-            selected_values = torch.masked_select(original_obs_weights, prune_mask)
-            abs_vals = torch.abs(selected_values)
-            avg_abs = torch.mean(abs_vals, dim=0)
-            min_abs = torch.min(abs_vals, dim=0)
-            max_abs = torch.max(abs_vals, dim=0)
-            #print("Sample weight after LOBS:", layer.weight.data[(375129 // layer.in_features)][(375129 % layer.in_features)])
-            print("LOBS pruned ", count, "weights, after surgeon, accurate=", acc, "layer loss=", loss, ",exection time:", (end_time - start_time), "seconds," + "Avg abs:", avg_abs, ", min abs:", min_abs, "max_abs:", max_abs, "L2 norm of original weight:", torch.norm(flat_weight, p=2), "L2 norm of original delta:", torch.norm(original_delta, p=2), "After surgeon, L2 norm is:", torch.norm(layer.weight.data.flatten(), p=2))
-            layer.weight.data = original_weight
+    start_time = time.time()
+    prune_seq_2d, loss_table_2d, accum_delta_w_table_2d = prePrune(model, layer, h, hinv, gbase)
+    end_time = time.time()
+    pre_prune_time = end_time - start_time
+    start_time = time.time()
+    original_weight, loss = greedyPrune(model, layer, 390000, prune_seq_2d, loss_table_2d, accum_delta_w_table_2d)
+    end_time = time.time()
+    prune_time = end_time - start_time
+    acc = eval(model, test_dataset, test_loader)
+    print("After ", 390000, " nodes surgeon, accurate=", acc, "layer loss=", loss, "pre prune time=", pre_prune_time, " seconds, prune_time=", prune_time, " seconds)
     break

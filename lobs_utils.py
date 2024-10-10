@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import hessianorpinv_matmul_vector as custom_kernels
 import sys
+import heapq
 
 class LobsDnnModel(nn.Module):
     def __init__(self):
@@ -11,13 +12,17 @@ class LobsDnnModel(nn.Module):
         self.withReLUs = set([])
         self.hessians = []
         self.hpinvs = []
+        self.hbases = []
+        self.gradients = []
         self.sampleCount = 0
+        self.alpha = 0.0 # LOBS L2正则化系数
 
     def resetHessianStats(self):
         for i in range(0, len(self.hessians)):
             self.hessians[i] = None
-        for i in range(0, len(self.hpinvs)):
             self.hpinvs[i] = None
+            self.hbases[i] = None
+            self.gradients[i] = None
         self.sampleCount = 0
 
 # 批量更新海塞矩阵相关统计值
@@ -36,132 +41,159 @@ def updateHessianStats(model, inputs):
                 inputs = outputs
                 model.hessians.append(None)
                 model.hpinvs.append(None)
+                model.hbases.append(None)
+                model.gradients.append(None)
                 continue
             if len(model.hessians) <= j:
-                model.hessians.append(torch.zeros((inputs.size(1), inputs.size(1)), dtype=torch.float))
+                model.hessians.append(torch.zeros((inputs.size(1), inputs.size(1)), dtype=torch.float64))
+                model.hbases.append(torch.zeros((inputs.size(1), inputs.size(1)), dtype=torch.float64))
                 model.hpinvs.append(None)
+                model.gradients.append(torch.zeros((inputs.size(1), 1), dtype=torch.float64))
             elif model.hessians[j] is None:
-                model.hessians[j] = torch.zeros((inputs.size(1), inputs.size(1)), dtype=torch.float)
+                model.hessians[j] = torch.zeros((inputs.size(1), inputs.size(1)), dtype=torch.float64)
+                model.hbases[j] = torch.zeros((inputs.size(1), inputs.size(1)), dtype=torch.float64)
+                model.gradients[j] = torch.zeros((inputs.size(1), 1), dtype=torch.float64)
             outer_products = torch.bmm(inputs.unsqueeze(2), inputs.unsqueeze(1))
             model.hessians[j] += outer_products.sum(dim=0)
+            dim=inputs.size(1)
+            model.gradients[j] += inputs.sum(dim=0).view(dim, 1)
             inputs = outputs
 
 # 计算各个subblock的hessian和伪逆阵
-def calcHessiansAndPinvs(model, gama):
+def calcHessiansAndPinvs(model, alpha):
     print("Sample count:", model.sampleCount)
+    model.alpha = alpha
     for i, (name, layer) in enumerate(model.named_children()):
         if model.hessians[i] is None:
             continue
         h = model.hessians[i]
         h /= model.sampleCount
-        h += gama * torch.eye(h.size(0))
         h *= 2
+        hbase = h.clone()
+        h += 2 * alpha * torch.eye(h.size(0))
         print("Layer:", i, "Hessian sub block Shape: ", h.size())
         print("Layer:", i, "Hessian sub block Rank: ", torch.linalg.matrix_rank(h))
 
         print("Layer:", i, "Constructing sub block hessian Pseudo-inverse...")
-        hpinv = torch.linalg.pinv(h)
+        hpinv = torch.cholesky_inverse(torch.linalg.cholesky(h))
+        #hpinv = torch.linalg.pinv(h)
+        model.hbases[i] = hbase
         model.hpinvs[i] = hpinv
+        model.gradients[i] *= 2
+        model.gradients[i] /= model.sampleCount
 
-# 从hessian或逆阵中取元素，只有其对角中分布有subblock，其他均为0
-def get_element_from_horpinv(subblock, row, col):
-    blk_row_idx = row // subblock.size(0)
-    blk_col_idx = col // subblock.size(1)
-    if blk_row_idx != blk_col_idx:
-        return 0.0
-    return subblock[(row % subblock.size(0))][(col % subblock.size(1))]
+def prePrune(model, layer, h, hinv, gbase):
+    # 逐个输出节点地计算
+    gbase = h
+    rows = layer.weight.data.size(0)
+    cols = layer.weight.data.size(1)
+    alpha = model.alpha
+    prune_seq_2d = []
+    loss_table_2d = []
+    accum_delta_w_table_2d = []
+    original_h = h
+    original_hinv = hinv
+    original_gbase = gbase
+    for j in range(0, rows):
+        print("ROW:", j)
+        weight = layer.weight.data[j].clone().view(cols, 1)
+        accum_delta_w = torch.zeros(cols, 1, dtype=torch.float64)
+        accum_delta_w_itr = torch.zeros(cols, 1, dtype=torch.float64)
+        accum_loss = 0
+        mask = torch.zeros(cols, 1, dtype=torch.bool)
+        inverted_mask = torch.ones(cols, 1, dtype=torch.bool)
+        retain_indices = torch.nonzero(inverted_mask)
+        prune_seq = []
+        loss_table = []
+        accum_delta_w_table = [] # 可以减少recomputation，但空间大小为rows*rows*cols float，占800M+
+        h = original_h
+        hinv = original_hinv
+        gbase = original_gbase
+        for c in range(0, cols):
+            min_loss = float('inf')
+            min_pos = -1
+            min_global_pos = -1
+            min_delta_w = None
+            min_delta_w_itr = None
+            min_itr_inv = None
+            for k in range(0, h.size(0)):
+                print("K:", k)
+                global_pos = retain_indices[k][0]
+                print("GLOBAL_POS:", global_pos)
+                print("HINV:", hinv)
+                inv_row = hinv[:,k].view(1, hinv.size(0))
+                decr = torch.mm(torch.transpose(inv_row, 0, 1), inv_row) / hinv[k][k]
+                tmp_itr_inv = hinv - decr
+                print("TMP_ITR_INV_1:", tmp_itr_inv)
+                tmp_itr_inv = torch.cat((tmp_itr_inv[:k,:], tmp_itr_inv[(k+1):,:]), dim=0)
+                tmp_itr_inv = torch.cat((tmp_itr_inv[:,:k], tmp_itr_inv[:,(k+1):]), dim=1)
+                print("TMP_ITR_INV_2:", tmp_itr_inv)
+                #g = accum_delta_w * gbase + 2 * alpha * accum_delta_w
+                #g = gbase + alpha * accum_delta_w_itr * gbase
+                #g = gbase + 2 * alpha * accum_delta_w
+                g = torch.mm(h, accum_delta_w_itr)
+                print("G:", g)
+                beta = weight[global_pos][0] * h[:,k].view(h.size(0), 1)
+                print("BETA_1:", beta)
+                beta -= g
+                print("BETA_2:", beta)
+                beta = torch.cat((beta[:k,], beta[(k+1):,]), dim=0)
+                print("BETA_3:", beta)
+                tmp_delta_w = torch.mm(tmp_itr_inv, beta)
+                tmp_delta_w = torch.cat((tmp_delta_w[:k,], (-weight[global_pos]).view(1,1), tmp_delta_w[k:,]), dim=0)
+                loss = torch.mm(g.t(), tmp_delta_w) + torch.mm(tmp_delta_w.t(), torch.mm(h, tmp_delta_w)) / 2.0
+                loss = loss[0].double()
+                if loss < min_loss:
+                    min_loss = loss
+                    min_pos = k
+                    min_global_pos = global_pos
+                    min_delta_w = tmp_delta_w
+                    min_itr_inv = tmp_itr_inv
+                if j == 0 and c == 0 and k == 0:
+                    print("MIN_LOSS:", min_loss)
+                    print("MIN_DELTA_W:", min_delta_w)
+                    input("按任意键继续。。。")
+            flatten_delta_w = torch.zeros((cols, 1), dtype=torch.float64)
+            flatten_delta_w.masked_scatter_(inverted_mask, min_delta_w)
+            weight += flatten_delta_w
+            accum_delta_w += flatten_delta_w
+            accum_delta_w_itr += min_delta_w
+            accum_delta_w_itr = torch.cat((accum_delta_w_itr[:min_pos,], accum_delta_w_itr[(min_pos+1):,:]), dim=0)
+            accum_loss += min_loss
+            hinv = min_itr_inv
+            h = torch.cat((h[:min_pos,:], h[(min_pos+1):,:]), dim=0)
+            h = torch.cat((h[:,:min_pos], h[:,(min_pos+1):]), dim=1)
+            gbase = torch.cat((g[:min_pos,:], g[(min_pos+1):,:]), dim=0)
+            mask[min_global_pos][0] = True
+            inverted_mask[min_global_pos][0] = False
+            retain_indices = torch.nonzero(inverted_mask)
+            prune_seq.append(min_global_pos)
+            loss_table.append(accum_loss.clone())
+            accum_delta_w_table.append(accum_delta_w.clone())
+        prune_seq_2d.append(prune_seq)
+        loss_table_2d.append(loss_table)
+        accum_delta_w_table_2d.append(accum_delta_w_table)
+    return prune_seq_2d, loss_table_2d, accum_delta_w_table_2d
 
-# 基于magnitude选择要剪枝的节点
-def prune_fcn_layer(layer, count):
-    flat_weight = layer.weight.flatten()
-    weight_abs = torch.abs(flat_weight)
-    max_val = torch.max(weight_abs)
-    values, indices = torch.topk(weight_abs, count, largest=False)
-    threshold = torch.max(values)
-    min_val = torch.min(values)
-    print(f"Pruning {count} weights according to weight abs.Max weight abs={max_val}, min={min_val}, threshold={threshold}")
-    return indices
-
-def optimal_brain_surgeon(layer, indices, h_block, hpinv_block):
-    flat_weight = layer.weight.flatten()
-    #print("Sample weight:", flat_weight[375129])
-    prune_mask = torch.zeros(layer.in_features * layer.out_features, dtype=torch.bool)
-    prune_mask.index_fill_(0, indices, True)
-
-    flat_weight = flat_weight.unsqueeze(1)
-    #print("Sample weight2:", flat_weight[375129][0])
-
-    accum_factor_vector = torch.zeros((layer.in_features * layer.out_features, 1), dtype=torch.float)
-    for pos in indices:
-        #accum_factor_vector[pos][0] = get_element_from_horpinv(h_block, pos, pos) * flat_weight[pos][0]
-       val = get_element_from_horpinv(h_block, pos, pos) * flat_weight[pos][0]
-       #print("val: ", val, "pos:", pos, "elem:", get_element_from_horpinv(h_block, pos, pos), "w:", flat_weight[pos][0])
-       accum_factor_vector[pos][0] = val
-    print(accum_factor_vector)
-    original_delta = (-1) * custom_kernels.hessianorpinv_matmul_vector(hpinv_block, accum_factor_vector, layer.out_features)
-    w = flat_weight + original_delta
-    prune_mask = prune_mask.unsqueeze(1)
-    w.masked_fill_(prune_mask, 0.0) # 对剪枝位置进行屏蔽，以规避计算的不精确
-    delta_w = w - flat_weight
-    loss = torch.mm(torch.transpose(custom_kernels.hessianorpinv_matmul_vector(h_block, delta_w, layer.out_features), 0, 1), delta_w) / 2.0
-
-    flat_weight += delta_w
-    return flat_weight.squeeze(1).view(layer.out_features, layer.in_features), loss[0][0].item(), original_delta
-
-def optimal_brain_surgeon_v2(layer, indices, h_block):
-    flat_weight = layer.weight.flatten()
-    accum_factor_vector = torch.zeros(layer.in_features * layer.out_features, dtype=torch.float)
-    mask = torch.zeros(layer.in_features * layer.out_features, dtype=torch.bool)
-    mask[indices] = True
-    accum_factor_vector.scatter_(0, indices, flat_weight[mask])
-    accum_factor_vector = accum_factor_vector.unsqueeze(1)
-    original_beta = custom_kernels.hessianorpinv_matmul_vector(h_block, accum_factor_vector, layer.out_features)
-    original_epsilon = original_beta
-    row_mask = torch.ones(layer.in_features * layer.out_features, dtype=torch.bool)
-    row_mask[indices] = False
-    epsilon = original_beta[row_mask]
-    assert epsilon.size(0) == layer.in_features * layer.out_features - indices.size(0)
-    # 求裁剪之后的各个子逆阵
-    hessian_mask = row_mask.view(layer.out_features, layer.in_features)
-    hpinvs = []
-    CHECK_RANK=False
-    full_ranks = 0
-    for output_no in range(0, layer.out_features):
-        subblock = h_block.clone()
-        mask = hessian_mask[output_no]
-        subblock = subblock[mask]
-        subblock = subblock[:, mask]
-        #subblock = subblock + 2 * gama * torch.eye(subblock.size(0))
-        subblock = subblock.contiguous()
-        if CHECK_RANK:
-            if torch.linalg.matrix_rank(subblock).item() == subblock.size(0):
-                #if subblock.size(0) < 10:
-                #    print(subblock)
-                full_ranks += 1
-        inv = torch.linalg.inv(subblock)
-        hpinvs.append(inv)
-    if CHECK_RANK:
-        print("Full ranks:", full_ranks, "/", layer.out_features)
-    epsilon = epsilon.contiguous()
-    delta_star = custom_kernels.hessianorpinv_matmul_vector_v1(hpinvs, epsilon)
-    delta = torch.zeros(layer.in_features * layer.out_features, dtype=torch.float)
-    pre_pos = 0
-    compact_pos = 0
-    indices, _ = torch.sort(indices)
-    for pos in indices:
-        #print("Pre&Cur Pos:", pre_pos, pos, file=sys.stderr)
-        for i in range(pre_pos, pos):
-            delta[i] = delta_star[compact_pos][0]
-            compact_pos += 1
-        delta[pos] = -flat_weight[pos]
-        pre_pos = pos + 1
-    for i in range(pre_pos, layer.in_features * layer.out_features):
-        delta[i] = delta_star[compact_pos][0]
-        compact_pos += 1
-    delta = delta.view(layer.out_features * layer.in_features, 1)
-    print("Delta:", delta)
-    flat_weight = flat_weight.unsqueeze(1)
-    print("FlatWeight:", flat_weight)
-    flat_weight += delta
-    loss = torch.mm(torch.transpose(delta, 0, 1), custom_kernels.hessianorpinv_matmul_vector(h_block, delta, layer.out_features)) / 2.0
-    return flat_weight.squeeze(1).view(layer.out_features, layer.in_features), loss[0][0].item(), delta
+def greedyPrune(model, layer, prune_num, prune_seq_2d, loss_table_2d, accum_delta_w_table_2d):
+    rows = layer.weight.data.size(0)
+    cols = layer.weight.data.size(1)
+    prune_num_rows = [0 for _ in range(rows)]
+    heap = []
+    accum_loss = 0.0
+    original_weight = layer.weight.data.clone()
+    for i in range(rows):
+        heapq.heappush(heap, (loss_table_2d[i][prune_num_rows[i]], i))
+    for _ in range(prune_num):
+        loss, row_idx = heapq.heappop(heap)
+        accum_loss += loss
+        prune_num_rows[row_idx] += 1
+        n = prune_num_rows[row_idx]
+        if n < cols:
+            heapq.heappush(heap, (loss_table_2d[row_idx][n], row_idx))
+    for i in range(rows):
+        j = prune_num_rows[i] - 1
+        if j < 0:
+            continue
+        layer.weight.data[i] += accum_delta_w_table_2d[i][j].view(col)
+    return original_weight, accum_loss
